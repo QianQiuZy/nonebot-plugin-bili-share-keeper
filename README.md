@@ -75,10 +75,25 @@ _✨ 记录b站视频链接分享，并提示多次分享 ✨_
 
 | 配置项 | 必填 | 默认值 | 说明 |
 |:-----:|:----:|:----:|:----:|
-| bilibili_share_keeper_redis_url | 否 | redis://localhost:6379/0 | redis数据库地址 |
-| bilibili_share_keeper_target_group | 是 | 无 | 开启此插件的群聊 |
+| bilibili_share_keeper_redis_url | 否 | redis://localhost:6379/0 | redis数据库地址，不填或不可用时自动退回内存存储 |
+| bilibili_share_keeper_target_group | 是 | 无 | 开启此插件的群聊，支持单个群号或多个群号 |
 | bilibili_share_keeper_key_prefix | 否 | nb2:bili_share_keeper | redis中记录的前缀 |
 | bilibili_share_keeper_http_timeout | 否 | 10 | http请求的超时值 |
+
+### `bilibili_share_keeper_target_group` 配置示例
+
+支持以下形式：
+
+```env
+# 单个群
+bilibili_share_keeper_target_group=123456
+
+# 多个群（推荐 JSON 数组）
+bilibili_share_keeper_target_group=[123456, 234567, 345678]
+
+# 多个群（逗号分隔）
+bilibili_share_keeper_target_group=123456,234567,345678
+```
 
 ## 🕹️ 使用
 

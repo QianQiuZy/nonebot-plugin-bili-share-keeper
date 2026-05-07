@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from nonebot import get_driver, logger, on_message
 from nonebot.plugin import PluginMetadata
-from redis.asyncio import Redis
-from redis.exceptions import WatchError
+
+try:
+    from redis.asyncio import Redis as RedisClient
+    from redis.exceptions import RedisError, WatchError
+except ImportError:  # pragma: no cover
+    RedisClient = None
+    RedisError = Exception
+    WatchError = Exception
+
+if TYPE_CHECKING:  # pragma: no cover
+    from redis.asyncio import Redis as RedisType
+else:
+    RedisType = Any
 
 try:
     from nonebot import get_plugin_config
@@ -29,7 +42,7 @@ from .config import Config
 __plugin_meta__ = PluginMetadata(
     name="B站重复分享记录",
     description="记录指定群内的 B 站视频分享，并在重复分享时进行引用提醒。",
-    usage="配置 Redis 后加载插件即可。",
+    usage="配置目标群后加载插件即可；可选接入 Redis，不接入时使用内存记录。",
     config=Config,
 )
 
@@ -42,7 +55,10 @@ BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 
 driver = get_driver()
 share_matcher = on_message(priority=15, block=False)
-_redis_client: Optional[Redis] = None
+_redis_client: RedisType | None = None
+_memory_store: dict[str, dict[str, str]] = {}
+_memory_store_lock = asyncio.Lock()
+_memory_fallback_logged = False
 
 
 def _load_config() -> Config:
@@ -79,14 +95,39 @@ async def _close_redis() -> None:
         _redis_client = None
 
 
-async def _get_redis() -> Redis:
+def _log_memory_fallback(reason: str) -> None:
+    global _memory_fallback_logged
+    if _memory_fallback_logged:
+        return
+
+    logger.warning(f"B站分享记录插件将使用内存存储：{reason}")
+    _memory_fallback_logged = True
+
+
+async def _get_redis() -> RedisType | None:
     global _redis_client
+    redis_url = plugin_config.bilibili_share_keeper_redis_url.strip()
+    if RedisClient is None:
+        _log_memory_fallback("未安装 redis 依赖")
+        return None
+    if not redis_url:
+        _log_memory_fallback("未配置 Redis 地址")
+        return None
     if _redis_client is None:
-        _redis_client = Redis.from_url(
-            plugin_config.bilibili_share_keeper_redis_url,
+        _redis_client = RedisClient.from_url(
+            redis_url,
             decode_responses=True,
         )
-    return _redis_client
+    redis = _redis_client
+    if redis is None:
+        return None
+    try:
+        await redis.ping()
+    except Exception as exc:
+        _log_memory_fallback(f"Redis 不可用 ({exc!r})")
+        await _close_redis()
+        return None
+    return redis
 
 
 def _iter_strings(value: Any) -> Iterable[str]:
@@ -104,7 +145,7 @@ def _iter_strings(value: Any) -> Iterable[str]:
             yield from _iter_strings(item)
 
 
-def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
+def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     raw_text = raw_text.strip()
     if not raw_text:
         return None
@@ -126,8 +167,8 @@ def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _collect_payloads(message: Message) -> List[Dict[str, Any]]:
-    payloads: List[Dict[str, Any]] = []
+def _collect_payloads(message: Message) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
 
     for segment in message:
         if getattr(segment, "type", "") != "json":
@@ -152,8 +193,8 @@ def _normalize_url(url: str) -> str:
     return "https://" + normalized.lstrip("/")
 
 
-def _extract_b23_urls(payload: Dict[str, Any]) -> List[str]:
-    found: List[str] = []
+def _extract_b23_urls(payload: dict[str, Any]) -> list[str]:
+    found: list[str] = []
     seen = set()
 
     for source in _iter_strings(payload):
@@ -183,7 +224,7 @@ async def _resolve_url(short_url: str) -> str:
         return str(response.url)
 
 
-def _extract_bv(*texts: str) -> Optional[str]:
+def _extract_bv(*texts: str) -> str | None:
     for text in texts:
         match = BV_RE.search(text)
         if match:
@@ -208,19 +249,16 @@ def _redis_key(group_id: int, bv: str) -> str:
     return f"{prefix}:group:{group_id}:bv:{bv}"
 
 
-async def _register_share(
-    redis: Redis,
+def _build_first_record(
     *,
-    group_id: int,
     message_id: int,
     user_id: int,
     user_name: str,
     bv: str,
     short_url: str,
     resolved_url: str,
-) -> Tuple[bool, Dict[str, str]]:
-    key = _redis_key(group_id, bv)
-    first_record = {
+) -> dict[str, str]:
+    return {
         "bv": bv,
         "first_message_id": str(message_id),
         "first_user_id": str(user_id),
@@ -230,6 +268,59 @@ async def _register_share(
         "first_resolved_url": resolved_url,
         "count": "1",
     }
+
+
+async def _register_share_in_memory(
+    *,
+    group_id: int,
+    message_id: int,
+    user_id: int,
+    user_name: str,
+    bv: str,
+    short_url: str,
+    resolved_url: str,
+) -> tuple[bool, dict[str, str]]:
+    key = _redis_key(group_id, bv)
+    first_record = _build_first_record(
+        message_id=message_id,
+        user_id=user_id,
+        user_name=user_name,
+        bv=bv,
+        short_url=short_url,
+        resolved_url=resolved_url,
+    )
+
+    async with _memory_store_lock:
+        existing = _memory_store.get(key)
+        if not existing:
+            _memory_store[key] = first_record.copy()
+            return False, first_record
+
+        count = int(existing.get("count", "1")) + 1
+        existing["count"] = str(count)
+        return True, existing.copy()
+
+
+async def _register_share_in_redis(
+    redis: RedisType,
+    *,
+    group_id: int,
+    message_id: int,
+    user_id: int,
+    user_name: str,
+    bv: str,
+    short_url: str,
+    resolved_url: str,
+) -> tuple[bool, dict[str, str]]:
+    key = _redis_key(group_id, bv)
+    first_record = _build_first_record(
+        message_id=message_id,
+        user_id=user_id,
+        user_name=user_name,
+        bv=bv,
+        short_url=short_url,
+        resolved_url=resolved_url,
+    )
 
     while True:
         try:
@@ -252,12 +343,63 @@ async def _register_share(
             continue
 
 
+async def _register_share(
+    *,
+    group_id: int,
+    message_id: int,
+    user_id: int,
+    user_name: str,
+    bv: str,
+    short_url: str,
+    resolved_url: str,
+) -> tuple[bool, dict[str, str]]:
+    redis = await _get_redis()
+    if redis is None:
+        return await _register_share_in_memory(
+            group_id=group_id,
+            message_id=message_id,
+            user_id=user_id,
+            user_name=user_name,
+            bv=bv,
+            short_url=short_url,
+            resolved_url=resolved_url,
+        )
+
+    try:
+        return await _register_share_in_redis(
+            redis,
+            group_id=group_id,
+            message_id=message_id,
+            user_id=user_id,
+            user_name=user_name,
+            bv=bv,
+            short_url=short_url,
+            resolved_url=resolved_url,
+        )
+    except RedisError as exc:
+        _log_memory_fallback(f"Redis 读写失败 ({exc!r})")
+        await _close_redis()
+        return await _register_share_in_memory(
+            group_id=group_id,
+            message_id=message_id,
+            user_id=user_id,
+            user_name=user_name,
+            bv=bv,
+            short_url=short_url,
+            resolved_url=resolved_url,
+        )
+
+
+def _is_target_group(group_id: int) -> bool:
+    return group_id in plugin_config.bilibili_share_keeper_target_group
+
+
 @share_matcher.handle()
 async def handle_group_bilibili_share(bot: Bot, event: MessageEvent) -> None:
     if not isinstance(event, GroupMessageEvent):
         return
 
-    if event.group_id != plugin_config.bilibili_share_keeper_target_group:
+    if not _is_target_group(event.group_id):
         return
 
     payloads = _collect_payloads(event.message)
@@ -285,9 +427,7 @@ async def handle_group_bilibili_share(bot: Bot, event: MessageEvent) -> None:
             logger.debug(f"未能从分享消息中提取 BV 号，short_url={short_url}")
             continue
 
-        redis = await _get_redis()
         duplicate, record = await _register_share(
-            redis,
             group_id=event.group_id,
             message_id=event.message_id,
             user_id=event.user_id,
