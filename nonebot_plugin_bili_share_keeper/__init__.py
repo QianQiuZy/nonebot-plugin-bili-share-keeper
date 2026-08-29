@@ -211,16 +211,24 @@ def _extract_b23_urls(payload: dict[str, Any]) -> list[str]:
 async def _resolve_url(short_url: str) -> str:
     timeout = plugin_config.bilibili_share_keeper_http_timeout
     async with httpx.AsyncClient(
-        follow_redirects=True,
+        follow_redirects=False,
         timeout=timeout,
         headers={"User-Agent": USER_AGENT},
     ) as client:
         try:
             response = await client.head(short_url)
+            if response.headers.get("location"):
+                return str(response.url.join(response.headers["location"]))
             response.raise_for_status()
-        except Exception:
+        except httpx.HTTPError:
             response = await client.get(short_url)
+            if response.headers.get("location"):
+                return str(response.url.join(response.headers["location"]))
             response.raise_for_status()
+
+        location = response.headers.get("location")
+        if location:
+            return str(response.url.join(location))
         return str(response.url)
 
 
